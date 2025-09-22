@@ -4,7 +4,15 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13.6"
-dependencies = []
+dependencies = [
+    "bs4>=0.0.2",
+    "dotenv>=0.9.9",
+    "edgar>=5.6.3",
+    "pandas>=2.3.2",
+    "requests>=2.32.5",
+    "tabulate>=0.9.0",
+    "typing>=3.10.0.0",
+]
 
 [dependency-groups]
 dev = [
