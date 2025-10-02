@@ -19,6 +19,18 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+class SectionType(Enum):
+    """Types of sections in SEC filings."""
+
+    BUSINESS = "business"
+    RISK_FACTORS = "risk_factors"
+    FINANCIAL_STATEMENTS = "financial_statements"
+    MD_A = "management_discussion"
+    LEGAL = "legal"
+    PROPERTIES = "properties"
+    OTHER = "other"
+
+
 class ChunkingStrategy(Enum):
     """Different strategies for text chunking."""
 
@@ -27,6 +39,7 @@ class ChunkingStrategy(Enum):
     PARAGRAPH = "paragraph"
     SEMANTIC = "semantic"
     SECTION = "section"
+    SECTION_AWARE = "section_aware"
 
 
 class EmbeddingModel(Enum):
@@ -47,6 +60,45 @@ DEFAULT_MAX_CHUNK_SIZE = 2000
 DEFAULT_BATCH_SIZE = 32
 DEFAULT_EMBEDDING_MODEL = EmbeddingModel.SENTENCE_TRANSFORMERS_ALL_MINI
 
+# Optimal chunking configurations per section type
+SECTION_CHUNK_CONFIGS = {
+    SectionType.FINANCIAL_STATEMENTS: {
+        "chunk_size": 800,
+        "overlap": 100,
+        "description": "Dense financial data - smaller chunks",
+    },
+    SectionType.RISK_FACTORS: {
+        "chunk_size": 1200,
+        "overlap": 250,
+        "description": "Detailed risk analysis - medium chunks with more overlap",
+    },
+    SectionType.BUSINESS: {
+        "chunk_size": 1500,
+        "overlap": 300,
+        "description": "Company overview - larger chunks for narrative flow",
+    },
+    SectionType.MD_A: {
+        "chunk_size": 1400,
+        "overlap": 280,
+        "description": "Management analysis - analytical content",
+    },
+    SectionType.LEGAL: {
+        "chunk_size": 1000,
+        "overlap": 200,
+        "description": "Legal proceedings - factual content",
+    },
+    SectionType.PROPERTIES: {
+        "chunk_size": 900,
+        "overlap": 150,
+        "description": "Property information - structured data",
+    },
+    SectionType.OTHER: {
+        "chunk_size": 1000,
+        "overlap": 200,
+        "description": "Other sections - default configuration",
+    },
+}
+
 
 def chunk_text(
     text: str,
@@ -56,6 +108,8 @@ def chunk_text(
     min_chunk_size: int = DEFAULT_MIN_CHUNK_SIZE,
     max_chunk_size: int = DEFAULT_MAX_CHUNK_SIZE,
     metadata: Optional[Dict[str, Any]] = None,
+    section_types: Optional[Dict[str, SectionType]] = None,
+    sections_dict: Optional[Dict[str, str]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Chunk text based on the specified strategy.
@@ -68,6 +122,8 @@ def chunk_text(
         min_chunk_size: Minimum chunk size
         max_chunk_size: Maximum chunk size
         metadata: Optional metadata to attach to chunks
+        section_types: Dict mapping section names to SectionType for section-aware chunking
+        sections_dict: Dict of {section_name: section_content} for section-aware chunking
 
     Returns:
         List of chunk dictionaries with text, chunk_id, positions, and metadata
@@ -89,6 +145,13 @@ def chunk_text(
         return _chunk_semantic(text, chunk_size, overlap_size, min_chunk_size, metadata)
     elif strategy == ChunkingStrategy.SECTION:
         return _chunk_by_sections(text, min_chunk_size, metadata)
+    elif strategy == ChunkingStrategy.SECTION_AWARE:
+        if not sections_dict or not section_types:
+            logger.warning(
+                "SECTION_AWARE strategy requires sections_dict and section_types. Falling back to SECTION strategy."
+            )
+            return _chunk_by_sections(text, min_chunk_size, metadata)
+        return _chunk_by_sections_aware(sections_dict, section_types, metadata)
     else:
         raise ValueError(f"Unknown chunking strategy: {strategy}")
 
@@ -310,6 +373,116 @@ def _chunk_by_sections(
                 },
             }
             chunks.append(chunk)
+
+    # Update total_chunks for all chunks
+    for chunk in chunks:
+        chunk["metadata"]["total_chunks"] = len(chunks)
+
+    return chunks
+
+
+def _chunk_by_sections_aware(
+    sections_dict: Dict[str, str],
+    section_types: Dict[str, SectionType],
+    metadata: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """
+    Apply optimal chunking to sections with their already-classified types.
+
+    Args:
+        sections_dict: Dictionary of {section_name: section_content}
+        section_types: Dictionary of {section_name: SectionType} (already classified)
+        metadata: Optional base metadata
+
+    Returns:
+        List of chunk dictionaries
+    """
+    all_chunks = []
+
+    for section_name, section_content in sections_dict.items():
+        # Get the already-classified section type
+        section_type = section_types.get(section_name, SectionType.OTHER)
+
+        # Get optimal config for this section type
+        config = SECTION_CHUNK_CONFIGS[section_type]
+        chunk_size = config["chunk_size"]
+        overlap = config["overlap"]
+
+        # Chunk this section with optimal config
+        section_chunks = _sliding_window_chunk_aware(
+            section_content,
+            chunk_size=chunk_size,
+            overlap_size=overlap,
+            metadata={
+                **metadata,
+                "section": section_name,
+                "section_type": section_type.value,
+                "chunking_strategy": f"section_aware_{section_name}",
+                "optimal_chunk_size": chunk_size,
+                "optimal_overlap": overlap,
+            },
+        )
+
+        all_chunks.extend(section_chunks)
+
+    return all_chunks
+
+
+def _sliding_window_chunk_aware(
+    text: str,
+    chunk_size: int = 1000,
+    overlap_size: int = 200,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Apply sliding window chunking to text with enhanced metadata.
+
+    Args:
+        text: Text to chunk
+        chunk_size: Size of each chunk in characters
+        overlap_size: Overlap between chunks in characters
+        metadata: Optional metadata to attach to chunks
+
+    Returns:
+        List of chunk dictionaries
+    """
+    if metadata is None:
+        metadata = {}
+
+    chunks = []
+    start = 0
+    chunk_id = 0
+
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+
+        # Adjust end to preserve sentence boundaries
+        if end < len(text):
+            end = _find_sentence_boundary(text, start, end)
+
+        chunk_text = text[start:end].strip()
+
+        if len(chunk_text) >= 100:  # Minimum chunk size
+            chunk = {
+                "text": chunk_text,
+                "chunk_id": f"{metadata.get('source_id', 'unknown')}_{chunk_id}",
+                "start_pos": start,
+                "end_pos": end,
+                "metadata": {
+                    **metadata,
+                    "chunk_index": chunk_id,
+                    "chunk_size": len(chunk_text),
+                    "overlap_size": overlap_size,
+                    "total_chunks": None,  # Will be set later
+                },
+            }
+            chunks.append(chunk)
+            chunk_id += 1
+
+        # Move start position with overlap
+        start = end - overlap_size
+        if start >= end:  # Prevent infinite loop
+            start = end
 
     # Update total_chunks for all chunks
     for chunk in chunks:
@@ -579,6 +752,44 @@ def process_text_pipeline(
     return chunks, embeddings
 
 
+def process_sec_filing_sections(
+    sections_dict: Dict[str, str],
+    section_types: Dict[str, SectionType],
+    metadata: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Process SEC filing sections with optimal chunking per section type.
+
+    Args:
+        sections_dict: Dictionary of {section_name: section_content}
+        section_types: Dictionary of {section_name: SectionType} (already classified)
+        metadata: Optional base metadata
+
+    Returns:
+        List of all chunks from all sections
+    """
+    if metadata is None:
+        metadata = {}
+
+    logger.info(
+        f"Processing {len(sections_dict)} SEC filing sections with section-aware chunking"
+    )
+
+    chunks = chunk_text(
+        text="",  # Not used in SECTION_AWARE strategy
+        strategy=ChunkingStrategy.SECTION_AWARE,
+        sections_dict=sections_dict,
+        section_types=section_types,
+        metadata={
+            **metadata,
+            "processing_type": "sec_filing_sections",
+        },
+    )
+
+    logger.info(f"Created {len(chunks)} chunks from SEC filing sections")
+    return chunks
+
+
 # Example usage and CLI
 def main():
     parser = argparse.ArgumentParser(description="Text Vectorization Utility")
@@ -589,7 +800,7 @@ def main():
         "--strategy",
         choices=[s.value for s in ChunkingStrategy],
         default=ChunkingStrategy.SENTENCE.value,
-        help="Chunking strategy",
+        help="Chunking strategy (use 'section_aware' for SEC filing sections)",
     )
     parser.add_argument("--chunk-size", type=int, default=1000, help="Chunk size")
     parser.add_argument("--overlap-size", type=int, default=200, help="Overlap size")
